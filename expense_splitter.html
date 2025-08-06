@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Shared Expense Splitter</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, deleteDoc, onSnapshot, query, orderBy } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by the Canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app;
+        let db;
+        let auth;
+        let currentUserId = null;
+        let expenses = [];
+        let contributionChart;
+
+        const people = ['Jordan', 'Ben', 'Jared', 'Pat'];
+        const personSummaryEls = {};
+
+        const formatCurrency = (num) => `$${num.toFixed(2)}`;
+
+        const showLoading = () => {
+            document.getElementById('loading-indicator').classList.remove('hidden');
+        };
+
+        const hideLoading = () => {
+            document.getElementById('loading-indicator').classList.add('hidden');
+        };
+
+        const renderExpenses = () => {
+            const expenseListEl = document.getElementById('expense-list');
+            const emptyRowEl = document.getElementById('empty-row');
+            expenseListEl.innerHTML = '';
+            if (expenses.length === 0) {
+                expenseListEl.appendChild(emptyRowEl);
+                return;
+            }
+
+            expenses.forEach((expense) => {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td class="px-6 py-4 whitespace-nowrap">${expense.description}</td>
+                    <td class="px-6 py-4 whitespace-nowrap">${formatCurrency(expense.amount)}</td>
+                    <td class="px-6 py-4 whitespace-nowrap">${expense.payer}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                        <button data-id="${expense.id}" class="text-red-600 hover:text-red-900 delete-btn">Delete</button>
+                    </td>
+                `;
+                expenseListEl.appendChild(row);
+            });
+        };
+        
+        const renderSummary = () => {
+            const totalSpentEl = document.getElementById('total-spent');
+            const settlementPlanEl = document.getElementById('settlement-plan');
+
+            const totalSpent = expenses.reduce((sum, expense) => sum + expense.amount, 0);
+            const sharePerPerson = totalSpent / people.length;
+
+            const paidByPerson = people.reduce((acc, person) => {
+                acc[person] = expenses
+                    .filter(e => e.payer === person)
+                    .reduce((sum, e) => sum + e.amount, 0);
+                return acc;
+            }, {});
+
+            const balances = people.reduce((acc, person) => {
+                acc[person] = paidByPerson[person] - sharePerPerson;
+                return acc;
+            }, {});
+            
+            totalSpentEl.textContent = formatCurrency(totalSpent);
+
+            people.forEach(person => {
+                const balanceEl = personSummaryEls[person].balance;
+                const paidEl = personSummaryEls[person].paid;
+                const balance = balances[person];
+
+                balanceEl.textContent = formatCurrency(balance);
+                paidEl.textContent = formatCurrency(paidByPerson[person]);
+                
+                balanceEl.classList.remove('positive-balance', 'negative-balance');
+                if (balance > 0.005) {
+                    balanceEl.classList.add('positive-balance');
+                } else if (balance < -0.005) {
+                    balanceEl.classList.add('negative-balance');
+                }
+            });
+
+            updateChart(paidByPerson);
+            generateSettlementPlan(balances);
+        };
+
+        const generateSettlementPlan = (balances) => {
+            const settlementPlanEl = document.getElementById('settlement-plan');
+            settlementPlanEl.innerHTML = '';
+            const debtors = [];
+            const creditors = [];
+
+            people.forEach(person => {
+                if (balances[person] < -0.005) {
+                    debtors.push({ name: person, amount: -balances[person] });
+                } else if (balances[person] > 0.005) {
+                    creditors.push({ name: person, amount: balances[person] });
+                }
+            });
+
+            if (debtors.length === 0 && creditors.length === 0) {
+                settlementPlanEl.innerHTML = '<p>Everyone is settled up!</p>';
+                return;
+            }
+
+            const transactions = [];
+            let i = 0, j = 0;
+            while (i < debtors.length && j < creditors.length) {
+                const debtor = debtors[i];
+                const creditor = creditors[j];
+                const amount = Math.min(debtor.amount, creditor.amount);
+
+                transactions.push(`${debtor.name} pays ${creditor.name} ${formatCurrency(amount)}.`);
+                
+                debtor.amount -= amount;
+                creditor.amount -= amount;
+
+                if (debtor.amount < 0.01) i++;
+                if (creditor.amount < 0.01) j++;
+            }
+
+            if (transactions.length > 0) {
+                transactions.forEach(t => {
+                    const p = document.createElement('p');
+                    p.textContent = t;
+                    settlementPlanEl.appendChild(p);
+                });
+            } else {
+                 settlementPlanEl.innerHTML = '<p>Everyone is settled up!</p>';
+            }
+        };
+
+        const initChart = () => {
+            const ctx = document.getElementById('contribution-chart').getContext('2d');
+            contributionChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: people,
+                    datasets: [{
+                        label: 'Total Paid',
+                        data: [0, 0, 0, 0],
+                        backgroundColor: [
+                            'rgba(255, 99, 132, 0.5)',
+                            'rgba(54, 162, 235, 0.5)',
+                            'rgba(255, 206, 86, 0.5)',
+                            'rgba(75, 192, 192, 0.5)'
+                        ],
+                        borderColor: [
+                            'rgba(255, 99, 132, 1)',
+                            'rgba(54, 162, 235, 1)',
+                            'rgba(255, 206, 86, 1)',
+                            'rgba(75, 192, 192, 1)'
+                        ],
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            ticks: {
+                                callback: function(value) {
+                                    return '$' + value;
+                                }
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            display: false
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    return `Paid: ${formatCurrency(context.raw)}`;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        };
+
+        const updateChart = (paidByPerson) => {
+            contributionChart.data.datasets[0].data = people.map(p => paidByPerson[p]);
+            contributionChart.update();
+        };
+        
+        const updateAll = () => {
+            renderExpenses();
+            renderSummary();
+        };
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            // Map person names to their respective summary elements
+            people.forEach((name, index) => {
+                personSummaryEls[name] = {
+                    balance: document.getElementById(`person-${index + 1}-balance`),
+                    paid: document.getElementById(`person-${index + 1}-paid`)
+                };
+            });
+
+            const expenseForm = document.getElementById('expense-form');
+            const expenseListEl = document.getElementById('expense-list');
+            const userIdDisplay = document.getElementById('user-id-display');
+
+            showLoading();
+
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        currentUserId = user.uid;
+                        userIdDisplay.textContent = `Your User ID: ${currentUserId}`;
+                        
+                        const expensesCollectionRef = collection(db, `artifacts/${appId}/public/data/expenses`);
+                        onSnapshot(expensesCollectionRef, (snapshot) => {
+                            expenses = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                            updateAll();
+                            hideLoading();
+                        }, (error) => {
+                            console.error("Error listening to expenses:", error);
+                            hideLoading();
+                        });
+                    } else {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    }
+                });
+
+                expenseForm.addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    const description = expenseForm.description.value.trim();
+                    const amount = parseFloat(expenseForm.amount.value);
+                    const payer = expenseForm.payer.value;
+
+                    if (description && amount > 0 && payer) {
+                        try {
+                            const expensesCollectionRef = collection(db, `artifacts/${appId}/public/data/expenses`);
+                            await addDoc(expensesCollectionRef, {
+                                description,
+                                amount,
+                                payer,
+                                createdAt: new Date().toISOString()
+                            });
+                            expenseForm.reset();
+                        } catch (error) {
+                            console.error("Error adding document: ", error);
+                        }
+                    }
+                });
+
+                expenseListEl.addEventListener('click', async (e) => {
+                    if (e.target.classList.contains('delete-btn')) {
+                        const expenseId = e.target.dataset.id;
+                        try {
+                            const expensesCollectionRef = collection(db, `artifacts/${appId}/public/data/expenses`);
+                            await deleteDoc(doc(expensesCollectionRef, expenseId));
+                        } catch (error) {
+                            console.error("Error deleting document: ", error);
+                        }
+                    }
+                });
+
+                initChart();
+
+            } catch (error) {
+                console.error("Error initializing Firebase or authentication:", error);
+                hideLoading();
+            }
+        });
+    </script>
+    <!-- Chosen Palette: Warm Sand & Slate -->
+    <!-- Application Structure Plan: A task-oriented dashboard design was chosen to create a functional tool rather than just displaying instructions. The structure includes: 1) An input form at the top for the primary user task of adding expenses. 2) A dynamic summary section with cards and a chart for at-a-glance understanding of the current financial state. 3) A detailed expense list table for transparent tracking. 4) A clear settlement plan at the bottom. This flow guides the user from input to outcome logically, making the process of splitting bills intuitive and error-free, which is a significant usability improvement over a manual spreadsheet. -->
+    <!-- Visualization & Content Choices: Report Info: Splitting costs among 4 people. -> Goal: Simplify expense tracking and settlement. -> Viz/Presentation Method: 1) Expense Input: A structured HTML form for clear data entry. 2) Totals & Balances: High-contrast summary cards for quick reads on who owes/is owed. 3) Contribution Comparison: A Chart.js bar chart to visually compare what each person has paid. 4) Expense Log: An HTML table for detailed, organized records. 5) Settlement: A dynamically generated text block providing clear instructions on how to resolve balances. -> Interaction: Adding/deleting expenses dynamically updates all summary cards, the chart, the table, and the settlement plan in real-time. -> Justification: This interactive model automates all calculations, reduces user error, and provides immediate visual feedback, making the complex task of settling debts simple and transparent. -> Library/Method: Vanilla JS for logic, Chart.js for visualization (Canvas), Firestore for real-time data persistence. -->
+    <!-- CONFIRMATION: NO SVG graphics used. NO Mermaid JS used. -->
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #FDFBF8; /* Warm Sand */
+            color: #4A5568; /* Slate Gray */
+        }
+        .card {
+            background-color: #FFFFFF;
+            border-radius: 0.75rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            transition: all 0.3s ease-in-out;
+        }
+        .btn {
+            background-color: #4A5568; /* Slate */
+            color: #FFFFFF;
+            font-weight: 600;
+            border-radius: 0.5rem;
+            padding: 0.75rem 1.5rem;
+            transition: background-color 0.3s;
+        }
+        .btn:hover {
+            background-color: #2D3748; /* Darker Slate */
+        }
+        .input-field {
+            background-color: #F7FAFC;
+            border: 1px solid #E2E8F0;
+            border-radius: 0.5rem;
+            padding: 0.75rem;
+            width: 100%;
+        }
+        .positive-balance {
+            color: #38A169; /* Green */
+        }
+        .negative-balance {
+            color: #E53E3E; /* Red */
+        }
+        .chart-container {
+            position: relative;
+            width: 100%;
+            max-width: 600px;
+            margin-left: auto;
+            margin-right: auto;
+            height: 300px;
+            max-height: 400px;
+        }
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(255, 255, 255, 0.8);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+        .spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            border-left-color: #4A5568;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="antialiased">
+
+    <div id="loading-indicator" class="loading-overlay hidden">
+        <div class="spinner"></div>
+    </div>
+
+    <div class="container mx-auto p-4 sm:p-6 lg:p-8 max-w-7xl">
+
+        <header class="text-center mb-8">
+            <h1 class="text-4xl font-bold text-gray-800">Shared Expense Splitter</h1>
+            <p class="mt-2 text-lg text-gray-600">Add expenses below to automatically calculate who owes whom.</p>
+            <p id="user-id-display" class="mt-4 text-sm text-gray-500">Your User ID: Loading...</p>
+        </header>
+
+        <main>
+            <!-- Input Section -->
+            <section id="input-section" class="card p-6 mb-8">
+                <h2 class="text-2xl font-semibold mb-4 text-gray-700">Add a New Expense</h2>
+                <form id="expense-form" class="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
+                    <div class="md:col-span-2">
+                        <label for="description" class="block text-sm font-medium text-gray-700 mb-1">Description</label>
+                        <input type="text" id="description" name="description" class="input-field" placeholder="e.g., Groceries, Dinner" required>
+                    </div>
+                    <div>
+                        <label for="amount" class="block text-sm font-medium text-gray-700 mb-1">Amount ($)</label>
+                        <input type="number" id="amount" name="amount" class="input-field" placeholder="0.00" min="0.01" step="0.01" required>
+                    </div>
+                    <div>
+                        <label for="payer" class="block text-sm font-medium text-gray-700 mb-1">Paid By</label>
+                        <select id="payer" name="payer" class="input-field" required>
+                            <option value="Jordan">Jordan</option>
+                            <option value="Ben">Ben</option>
+                            <option value="Jared">Jared</option>
+                            <option value="Pat">Pat</option>
+                        </select>
+                    </div>
+                    <div class="md:col-start-4">
+                        <button type="submit" class="btn w-full">Add Expense</button>
+                    </div>
+                </form>
+            </section>
+
+            <!-- Summary Section -->
+            <section id="summary-section" class="mb-8">
+                <h2 class="text-2xl font-semibold mb-4 text-gray-700 text-center">Summary</h2>
+                 <div class="text-center mb-6">
+                    <p class="text-lg">Total Spent by Group: <span id="total-spent" class="font-bold text-2xl text-gray-800">$0.00</span></p>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+                    <div class="card p-4 text-center">
+                        <h3 class="text-lg font-semibold">Jordan</h3>
+                        <p class="text-2xl font-bold" id="person-1-balance">$0.00</p>
+                        <p class="text-sm text-gray-500">Paid: <span id="person-1-paid">$0.00</span></p>
+                    </div>
+                    <div class="card p-4 text-center">
+                        <h3 class="text-lg font-semibold">Ben</h3>
+                        <p class="text-2xl font-bold" id="person-2-balance">$0.00</p>
+                        <p class="text-sm text-gray-500">Paid: <span id="person-2-paid">$0.00</span></p>
+                    </div>
+                    <div class="card p-4 text-center">
+                        <h3 class="text-lg font-semibold">Jared</h3>
+                        <p class="text-2xl font-bold" id="person-3-balance">$0.00</p>
+                        <p class="text-sm text-gray-500">Paid: <span id="person-3-paid">$0.00</span></p>
+                    </div>
+                    <div class="card p-4 text-center">
+                        <h3 class="text-lg font-semibold">Pat</h3>
+                        <p class="text-2xl font-bold" id="person-4-balance">$0.00</p>
+                        <p class="text-sm text-gray-500">Paid: <span id="person-4-paid">$0.00</span></p>
+                    </div>
+                </div>
+                 <div class="card p-6">
+                     <h3 class="text-xl font-semibold mb-4 text-gray-700 text-center">Total Contributions</h3>
+                     <div class="chart-container">
+                        <canvas id="contribution-chart"></canvas>
+                     </div>
+                </div>
+            </section>
+
+            <!-- Expense List Section -->
+            <section id="list-section" class="card p-6 mb-8">
+                <h2 class="text-2xl font-semibold mb-4 text-gray-700">Expense Log</h2>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Description</th>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Amount</th>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Paid By</th>
+                                <th scope="col" class="relative px-6 py-3"><span class="sr-only">Delete</span></th>
+                            </tr>
+                        </thead>
+                        <tbody id="expense-list" class="bg-white divide-y divide-gray-200">
+                            <tr id="empty-row">
+                                <td colspan="4" class="px-6 py-4 text-center text-gray-500">No expenses added yet.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+            
+            <!-- Settlement Section -->
+            <section id="settlement-section" class="card p-6 bg-gray-50">
+                <h2 class="text-2xl font-semibold mb-4 text-gray-700">How to Settle Up</h2>
+                <div id="settlement-plan" class="text-gray-700 space-y-2">
+                    <p>Add some expenses to see the settlement plan.</p>
+                </div>
+            </section>
+
+        </main>
+
+        <footer class="text-center mt-12 text-gray-500 text-sm">
+            <p>Created to simplify shared expenses.</p>
+        </footer>
+    </div>
+</body>
+</html>
